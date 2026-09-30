@@ -1,0 +1,14 @@
+[project]
+name = "sim-alpasim"
+version = "0.1.0"
+description = "Platform sim MCP server over AlpaSim's CAT-K traffic service: implements sim_rollout (protocol 1.1)"
+requires-python = ">=3.11,<3.13"
+# The AlpaSim workspace packages (alpasim_grpc, alpasim-utils, alpasim-trafficsim,
+# utils_rs, trajdata-alpasim) are not on an index: they come from an upstream
+# NVlabs/alpasim checkout with `uv sync --package alpasim-trafficsim`. This
+# package is run with that environment's interpreter and PYTHONPATH pointing
+# here; see README.md.
+dependencies = ["mcp>=1.2,<2", "grpcio>=1.70", "numpy"]
+
+[project.scripts]
+sim-alpasim = "sim_alpasim.server:main"
