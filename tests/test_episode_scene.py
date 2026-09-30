@@ -184,3 +184,74 @@ def test_the_logged_ego_history_is_the_replacement_not_the_recording() -> None:
     ego = next(o for o in logged if o.object_id == "EGO")
     assert len(ego.trajectory.poses) == 10
     assert ego.trajectory.poses[5].pose.vec.y == pytest.approx(7.0)
+
+
+def test_a_state_the_service_did_not_simulate_is_dropped_not_spliced() -> None:
+    """The real reply shape: one pose per query, every fifth step.
+
+    Filling the four steps between from the recording made CAT-K agents jump
+    back and forth between two futures -- p95 |accel| of 800 m/s^2.
+    """
+    ep = _episode()
+    handover_us = TIME_ORIGIN_US + 400_000
+    sparse = {TIME_ORIGIN_US + i * 100_000: (0.12 * i, 9.0, 0.0) for i in (9, 14, 19)}
+    result = _assemble(ep, "focal", _states(), {"walker": sparse}, handover_us, queries=3)
+    walker = next(a for a in result.episode["agents"] if a["agent_id"] == "walker")["states"]
+    times = [round(s["time_s"], 1) for s in walker]
+    assert times == [0.0, 0.1, 0.2, 0.3, 0.4, 0.9, 1.4, 1.9]
+    assert all(s["position"][1] == pytest.approx(9.0) for s in walker[5:])
+
+
+def test_reacted_agents_lose_their_recorded_actions() -> None:
+    ep = _episode()
+    ep["agents"][1]["actions"] = [[0.1, 0.0, 0.0]] * 20
+    ep["agents"][3]["actions"] = [[0.2, 0.0, 0.0]] * 20
+    moved = {TIME_ORIGIN_US + i * 100_000: (float(i), 5.0, 0.0) for i in range(10, 20)}
+    result = _assemble(ep, "focal", _states(), {"walker": moved}, TIME_ORIGIN_US + 900_000, queries=1)
+    by_id = {a["agent_id"]: a for a in result.episode["agents"]}
+    assert "actions" not in by_id["walker"]
+    assert by_id["bike"]["actions"] == ep["agents"][3]["actions"]  # replayed: untouched
+
+
+class _Traj:
+    def __init__(self, poses: dict[int, tuple[float, float, float]]) -> None:
+        ts = sorted(poses)
+        self.timestamps_us = np.array(ts)
+        self.positions = np.array([[poses[t][0], poses[t][1], 0.0] for t in ts])
+        self.yaws = np.array([poses[t][2] for t in ts])
+
+
+class _Servicer:
+    def __init__(self, store: dict[str, dict[int, tuple[float, float, float]]]) -> None:
+        state = type("S", (), {"closed_loop_trajectories": {k: _Traj(v) for k, v in store.items()}})
+        self._sessions = {"s": state}
+
+
+def _us(i: int) -> int:
+    return TIME_ORIGIN_US + i * 100_000
+
+
+def test_forecast_poses_come_from_the_closed_loop_store() -> None:
+    from sim_alpasim.rollout import _forecast_poses
+
+    recorded = {_us(i): (float(i), 0.0, 0.0) for i in range(5)}
+    simulated = {_us(i): (float(i), 1.0, 0.0) for i in range(5, 15)}
+    servicer = _Servicer({"a": {**recorded, **simulated}, "never-forecast": recorded | {_us(9): (9.0, 0.0, 0.0)}})
+    replied = {"a": {_us(9): simulated[_us(9)], _us(14): simulated[_us(14)]}}
+    got = _forecast_poses(servicer, "s", replied, handover_us=_us(4))
+    assert set(got) == {"a"}
+    assert got["a"] == simulated
+
+
+def test_forecast_poses_refuse_a_store_they_cannot_trust() -> None:
+    from sim_alpasim.rollout import RolloutError, _forecast_poses
+
+    simulated = {_us(i): (float(i), 1.0, 0.0) for i in range(5, 15)}
+    with pytest.raises(RolloutError, match="no session state"):
+        _forecast_poses(_Servicer({}), "gone", {"a": {_us(9): simulated[_us(9)]}}, _us(4))
+    with pytest.raises(RolloutError, match="disagrees"):
+        _forecast_poses(_Servicer({"a": simulated}), "s", {"a": {_us(9): (0.0, 0.0, 0.0)}}, _us(4))
+    with pytest.raises(RolloutError, match="runs past"):
+        _forecast_poses(_Servicer({"a": simulated}), "s", {"a": {_us(9): simulated[_us(9)]}}, _us(4))
+    with pytest.raises(RolloutError, match="absent"):
+        _forecast_poses(_Servicer({}), "s", {"a": {_us(9): simulated[_us(9)]}}, _us(4))
