@@ -13,9 +13,16 @@ Session shape, in the service's terms:
   replacement trajectory is fed as the ``EGO`` update on every ``simulate``,
   and the service conditions its world model on it.
 * ``simulate`` is queried every ``prediction_steps * dt`` until the episode's
-  last timestamp; each reply carries the other agents' poses for the steps it
-  forecast. A ``FAILED_PRECONDITION`` (the model could not act) is raised,
-  never papered over with a replay — the protocol requires ``ok: false``.
+  last timestamp. A ``FAILED_PRECONDITION`` (the model could not act) is
+  raised, never papered over with a replay — the protocol requires ``ok: false``.
+* A reply carries each agent's pose *at the query time* plus any lookahead
+  past it; with queries one horizon apart the lookahead is empty, so the
+  intermediate steps never come back on the wire. The service merges every
+  forecast step into the session's ``closed_loop_trajectories`` (truncating
+  the recording at the first merged step), and that store — read before the
+  session closes — is where the poses come from. A state the model did not
+  simulate is dropped, never filled from the recording: a recorded pose next
+  to a simulated one is a teleport.
 """
 
 from __future__ import annotations
@@ -85,15 +92,17 @@ def _patched_states(
 ) -> list[dict[str, Any]]:
     """One agent's states with the simulated poses written in after handover.
 
-    States at or before handover -- and any the service did not return -- are
-    kept verbatim, velocity included. Simulated states get position and heading
-    from the service and a smoothed central-difference velocity over the patched
-    positions.
+    States at or before handover are kept verbatim, velocity included. After
+    handover a state is kept only if the service simulated it: it gets position
+    and heading from the service and a smoothed central-difference velocity over
+    the patched positions. A post-handover state the service did not return is
+    dropped -- filling it from the recording would splice two different
+    futures together.
     """
-    out = [dict(s) for s in states]
-    simulated = [i for i, s in enumerate(states) if _us(s) > handover_us and _us(s) in poses]
+    out = [dict(s) for s in states if _us(s) <= handover_us or _us(s) in poses]
+    simulated = [i for i, s in enumerate(out) if _us(s) > handover_us]
     for i in simulated:
-        x, y, yaw = poses[_us(states[i])]
+        x, y, yaw = poses[_us(out[i])]
         out[i]["position"] = [x, y]
         out[i]["heading_rad"] = yaw
     raw: list[tuple[float, float]] = []
@@ -278,6 +287,7 @@ def rollout(
                     traj.timestamps_us, np.asarray(traj.positions), traj.yaws, strict=True
                 ):
                     store[int(t)] = (float(p[0]), float(p[1]), float(y))
+        poses = _forecast_poses(servicer, session, poses, handover_us)
     finally:
         try:
             servicer.close_session(
@@ -287,6 +297,45 @@ def rollout(
             provider.forget(scene_id)
 
     return _assemble(episode, focal_agent_id, focal_trajectory, poses, handover_us, queries)
+
+
+def _forecast_poses(
+    servicer: Any,
+    session: str,
+    replied: Mapping[str, Mapping[int, tuple[float, float, float]]],
+    handover_us: int,
+) -> dict[str, dict[int, tuple[float, float, float]]]:
+    """Every simulated post-handover pose, from the session's closed-loop store.
+
+    Only agents the service answered for are taken: an agent it never forecast
+    keeps its seeded recording in the store, which is not a simulation. Each
+    reply pose must agree with the store, and the store must not run past the
+    agent's last reply -- if either fails, upstream's merge semantics changed
+    and the store can no longer be trusted to hold only simulated poses.
+    """
+    state = getattr(servicer, "_sessions", {}).get(session)
+    if state is None:
+        raise RolloutError("traffic service kept no session state to read the forecast from")
+    out: dict[str, dict[int, tuple[float, float, float]]] = {}
+    for oid, got in replied.items():
+        if not got:
+            continue
+        traj = state.closed_loop_trajectories.get(oid)
+        if traj is None:
+            raise RolloutError(f"agent {oid} answered but absent from the closed-loop store")
+        stored = {
+            int(t): (float(p[0]), float(p[1]), float(y))
+            for t, p, y in zip(traj.timestamps_us, np.asarray(traj.positions), traj.yaws, strict=True)
+            if int(t) > handover_us
+        }
+        last = max(got)
+        for t, pose in got.items():
+            if t not in stored or not np.allclose(stored[t], pose, atol=1e-3):
+                raise RolloutError(f"agent {oid}: reply pose at {t} disagrees with the store")
+        if max(stored) > last:
+            raise RolloutError(f"agent {oid}: store runs past the last forecast step")
+        out[oid] = stored
+    return out
 
 
 def _assemble(
@@ -311,7 +360,10 @@ def _assemble(
             agents.append(dict(agent))
             replayed.append(aid)
             continue
-        agents.append({**agent, "states": _patched_states(agent["states"], got, handover_us)})
+        patched = {**agent, "states": _patched_states(agent["states"], got, handover_us)}
+        # Recorded actions describe the recorded motion, not the simulated one.
+        patched.pop("actions", None)
+        agents.append(patched)
         reacted.append(aid)
     out = {**episode, "agents": agents}
     return RolloutResult(episode=out, reacted=tuple(reacted), replayed=tuple(replayed), queries=queries)
