@@ -36,7 +36,6 @@ from sim_alpasim.episode_scene import (
     TIME_ORIGIN_US,
     EpisodeScene,
     EpisodeSceneProvider,
-    states_from_trajectory,
     trajectory_from_states,
 )
 
@@ -65,6 +64,60 @@ class _Context:
         if self.code != grpc.StatusCode.OK:
             raise RolloutError(f"{what}: {self.code.name}: {self.details}")
 
+
+def _us(state: Mapping[str, Any]) -> int:
+    """A state's timestamp on the service's microsecond clock."""
+    return TIME_ORIGIN_US + int(round(float(state["time_s"]) * 1_000_000))
+
+
+#: Half-width, in samples, of the velocity smoothing applied to simulated
+#: states. AV2 tracker velocity jitters ~0.10 m/s step to step; a raw central
+#: difference of 10 Hz positions jitters ~0.26. The predictor reads velocity,
+#: so raw derivatives make a re-simulated agent look synthetic before it has
+#: done anything -- the same artefact motion-curation's generator had.
+VELOCITY_SMOOTH_HALF = 2
+
+
+def _patched_states(
+    states: Sequence[Mapping[str, Any]],
+    poses: Mapping[int, tuple[float, float, float]],
+    handover_us: int,
+) -> list[dict[str, Any]]:
+    """One agent's states with the simulated poses written in after handover.
+
+    States at or before handover -- and any the service did not return -- are
+    kept verbatim, velocity included. Simulated states get position and heading
+    from the service and a smoothed central-difference velocity over the patched
+    positions.
+    """
+    out = [dict(s) for s in states]
+    simulated = [i for i, s in enumerate(states) if _us(s) > handover_us and _us(s) in poses]
+    for i in simulated:
+        x, y, yaw = poses[_us(states[i])]
+        out[i]["position"] = [x, y]
+        out[i]["heading_rad"] = yaw
+    raw: list[tuple[float, float]] = []
+    n = len(out)
+    for i in range(n):
+        j, k = min(i + 1, n - 1), max(i - 1, 0)
+        dt = float(out[j]["time_s"]) - float(out[k]["time_s"])
+        if dt <= 0:
+            raw.append((0.0, 0.0))
+            continue
+        raw.append(
+            (
+                (out[j]["position"][0] - out[k]["position"][0]) / dt,
+                (out[j]["position"][1] - out[k]["position"][1]) / dt,
+            )
+        )
+    for i in simulated:
+        lo, hi = max(i - VELOCITY_SMOOTH_HALF, 0), min(i + VELOCITY_SMOOTH_HALF, n - 1)
+        window = raw[lo : hi + 1]
+        out[i]["velocity"] = [
+            sum(v[0] for v in window) / len(window),
+            sum(v[1] for v in window) / len(window),
+        ]
+    return out
 
 def build_servicer(
     *,
@@ -103,15 +156,16 @@ def build_servicer(
 
 
 def _logged(
-    scene: EpisodeScene, handover_us: int
+    scene: EpisodeScene, focal_trajectory: Sequence[Mapping[str, Any]], handover_us: int
 ) -> list[traffic_pb2.ObjectTrajectory]:
-    """Logged trajectories: EGO history up to handover, others in full."""
+    """Logged trajectories: EGO history up to handover, others in full.
+
+    The EGO history is taken from the *replacement* trajectory, not the
+    recording: the protocol says the client's trajectory replaces the focal
+    agent's history as well as its future, and a perturbation changes both.
+    """
     out: list[traffic_pb2.ObjectTrajectory] = []
-    focal = next(a for a in scene.episode["agents"] if a["agent_id"] == scene.focal_agent_id)
-    history = [
-        s for s in focal["states"]
-        if TIME_ORIGIN_US + int(round(float(s["time_s"]) * 1_000_000)) <= handover_us
-    ]
+    history = [s for s in focal_trajectory if _us(s) <= handover_us]
     rig = scene.rig
     vc = rig.vehicle_config
     out.append(
@@ -170,13 +224,16 @@ def rollout(
     Raises:
         RolloutError: If the service refuses the session or cannot predict.
     """
+    if not 1 <= history_steps < len(focal_trajectory):
+        raise RolloutError(
+            f"history_steps must be in [1, {len(focal_trajectory)}) for a "
+            f"{len(focal_trajectory)}-state focal trajectory, got {history_steps}"
+        )
     scene = EpisodeScene(episode=episode, focal_agent_id=focal_agent_id)
     scene_id = provider.register(scene)
     session = str(uuid.uuid4())
     dt_us = int(round(dt_s * 1_000_000))
-    times_us = [
-        TIME_ORIGIN_US + int(round(float(s["time_s"]) * 1_000_000)) for s in focal_trajectory
-    ]
+    times_us = [_us(s) for s in focal_trajectory]
     handover_us = times_us[history_steps - 1]
     ego_update = traffic_pb2.ObjectTrajectoryUpdate(
         object_id="EGO", trajectory=trajectory_to_grpc(trajectory_from_states(focal_trajectory))
@@ -188,7 +245,7 @@ def rollout(
                 session_uuid=session,
                 scene_id=scene_id,
                 random_seed=int(seed),
-                logged_object_trajectories=_logged(scene, handover_us),
+                logged_object_trajectories=_logged(scene, focal_trajectory, handover_us),
                 handover_time_us=handover_us,
             ),
             ctx,
@@ -254,17 +311,7 @@ def _assemble(
             agents.append(dict(agent))
             replayed.append(aid)
             continue
-        states = []
-        for s in agent["states"]:
-            t_us = TIME_ORIGIN_US + int(round(float(s["time_s"]) * 1_000_000))
-            if t_us > handover_us and t_us in got:
-                x, y, yaw = got[t_us]
-                states.append({**s, "position": [x, y], "heading_rad": yaw})
-            else:
-                states.append(dict(s))
-        # Velocity re-derived from the patched positions, like the recording's own.
-        rebuilt = states_from_trajectory(trajectory_from_states(states))
-        agents.append({**agent, "states": rebuilt})
+        agents.append({**agent, "states": _patched_states(agent["states"], got, handover_us)})
         reacted.append(aid)
     out = {**episode, "agents": agents}
     return RolloutResult(episode=out, reacted=tuple(reacted), replayed=tuple(replayed), queries=queries)

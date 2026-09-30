@@ -144,8 +144,10 @@ def sim_rollout(
         )
     except RolloutError as exc:
         return _err(str(exc))
-    except (KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
+    except (KeyError, ValueError, TypeError, IndexError, json.JSONDecodeError) as exc:
         return _err(f"bad request: {exc}")
+    except Exception as exc:  # noqa: BLE001 -- the protocol requires ok:false, never a crash
+        return _err(f"rollout failed: {type(exc).__name__}: {exc}")
     return _ok(
         episode=result.episode,
         backend="alpasim-catk",

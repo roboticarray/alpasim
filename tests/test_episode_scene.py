@@ -133,3 +133,54 @@ def test_assemble_patches_reacted_agents_after_handover_only() -> None:
     assert walker[15]["position"][1] == pytest.approx(15.0)  # after: simulated
     assert by_id["parked"]["states"] == ep["agents"][2]["states"]
     assert np.isfinite([s["velocity"][0] for s in walker]).all()
+
+
+def test_pre_handover_states_keep_the_recorded_velocity() -> None:
+    """Tracker velocity is filtered; re-deriving it makes an agent look synthetic."""
+    ep = _episode()
+    for i, s in enumerate(ep["agents"][1]["states"]):
+        s["velocity"] = [1.2 + 0.001 * i, 0.0]  # a distinctive, smooth recorded value
+    handover_us = TIME_ORIGIN_US + 900_000
+    moved = {TIME_ORIGIN_US + i * 100_000: (float(i), 5.0, 0.0) for i in range(10, 20)}
+    result = _assemble(ep, "focal", _states(), {"walker": moved}, handover_us, queries=1)
+    walker = next(a for a in result.episode["agents"] if a["agent_id"] == "walker")["states"]
+    for i in range(10):
+        assert walker[i]["velocity"] == ep["agents"][1]["states"][i]["velocity"]
+
+
+def test_simulated_velocity_is_smoothed_not_raw() -> None:
+    """Jittered simulated positions must not become jittered velocities."""
+    ep = _episode()
+    rng = np.random.default_rng(0)
+    handover_us = TIME_ORIGIN_US + 400_000
+    # Continue the walker's recorded 1.2 m/s path, with tracker-scale jitter.
+    moved = {
+        TIME_ORIGIN_US + i * 100_000: (0.12 * i + float(rng.uniform(-0.03, 0.03)), 5.0, 0.0)
+        for i in range(5, 20)
+    }
+    result = _assemble(ep, "focal", _states(), {"walker": moved}, handover_us, queries=1)
+    walker = next(a for a in result.episode["agents"] if a["agent_id"] == "walker")["states"]
+    vx = np.array([s["velocity"][0] for s in walker[8:18]])
+    raw = np.diff([s["position"][0] for s in walker[7:19]]) / 0.1
+    assert np.std(np.diff(vx)) < np.std(np.diff(raw)) / 2
+    assert abs(float(np.mean(vx)) - 1.2) < 0.3
+
+
+def test_rollout_refuses_history_longer_than_the_trajectory() -> None:
+    from sim_alpasim.rollout import RolloutError, rollout
+
+    with pytest.raises(RolloutError, match="history_steps"):
+        rollout(None, EpisodeSceneProvider(), _episode(), focal_agent_id="focal",
+                focal_trajectory=_states(n=10), history_steps=10)
+
+
+def test_the_logged_ego_history_is_the_replacement_not_the_recording() -> None:
+    """A perturbation changes the history too; the service must see the new one."""
+    from sim_alpasim.rollout import _logged
+
+    scene = EpisodeScene(episode=_episode(), focal_agent_id="focal")
+    replacement = _states(speed=3.0, y=7.0)
+    logged = _logged(scene, replacement, TIME_ORIGIN_US + 900_000)
+    ego = next(o for o in logged if o.object_id == "EGO")
+    assert len(ego.trajectory.poses) == 10
+    assert ego.trajectory.poses[5].pose.vec.y == pytest.approx(7.0)
